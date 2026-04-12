@@ -317,6 +317,24 @@ end
 end
 
 function out = runSingleCase(tc, chan, fs, opts)
+% runSingleCase
+% -------------------------------------------------------------------------
+% 对“一个 IQ 测试信号 + 一组信道文件”执行完整验证流程。
+%
+% 处理顺序:
+%   1) 从浮点 .mat 解包出 H 的 delay/real/imag
+%   2) 从 .irc/.ird 恢复定点系数与定点 delay_clk
+%   3) 将 CIR update rate 映射为每个 snapshot 持续的样点数
+%   4) 分别执行浮点链路与定点链路卷积
+%   5) 对定点全精度累加结果搜索最佳右移位
+%   6) 输出最佳 shift、宽搜索建议值及误差指标
+%
+% 注意:
+%   - 当前阶段 clk = fs，因此 delay_clk 直接等于样值移位
+%   - 正式信号与调试信号使用不同误差口径:
+%       normalized -> 与浮点信号按 [-1, 1] 量纲比较
+%       integer    -> 保持整数码流量纲比较
+% -------------------------------------------------------------------------
 floatH = unpackFloatH(chan.H);
 fixedH = parseFixedChannel(chan.irc_path, chan.ird_path, chan.IN_num, chan.OUT_num, chan.T_num, chan.Nsamples);
 coeffScale = estimateCoeffScale(floatH, fixedH);
@@ -327,9 +345,19 @@ end
 
 samplesPerSnapshot = max(1, round(fs / chan.cir_up_rate));
 
+% 输入扩展:
+% 当前样例主要是单路 IQ 输入。若未来某组信道要求 IN_num > 1，
+% 则按需求文档中的容错规则将同一路输入复制到多路输入端口上。
 floatInputs = expandInputs(tc.float_input, chan.IN_num);
 fixedInputs = expandInputs(tc.fixed_input, chan.IN_num);
 
+% 浮点链路:
+%   直接使用 double 精度的输入和 H 做时变 FIR 参考计算。
+%
+% 定点链路:
+%   输入来自 .txt 解析后的 int16，
+%   信道来自 .irc/.ird 解析后的 int16 / delay_clk，
+%   乘法与累加在 int64 中保持更高精度，直到最后一步才截位。
 floatOut = simulateTimeVaryingFirDouble(floatInputs, floatH, samplesPerSnapshot);
 fixedAccum = simulateTimeVaryingFirFixed(fixedInputs, fixedH, samplesPerSnapshot);
 
@@ -344,8 +372,13 @@ end
 metricScale = inputScale * coeffScale;
 
 if isnan(opts.manual_shift)
+    % 正式搜索范围:
+    %   按需求文档规定在 [shift_min, shift_max] 内寻找最佳 shift。
     [bestShift, fixedOutInt16, fixedOutMetric, metricInfo] = ...
         searchBestShift(fixedAccum, floatOut, tc.metric_mode, metricScale, opts.shift_min, opts.shift_max);
+    % 宽搜索建议值:
+    %   用更大的搜索范围给出一个“建议 shift”，帮助分析当前正式范围
+    %   是否存在饱和或范围不足的问题，但不替代正式结果。
     [wideSuggestionShift, ~, ~, wideMetricInfo] = ...
         searchBestShift(fixedAccum, floatOut, tc.metric_mode, metricScale, opts.wide_shift_min, opts.wide_shift_max);
 else
@@ -421,6 +454,27 @@ packed.delay_samples = round(packed.delay_ns * 1e-9 * 245.76e6); % 当前阶段 
 end
 
 function packed = parseFixedChannel(ircPath, irdPath, IN_num, OUT_num, T_num, Nsamples)
+% parseFixedChannel
+% -------------------------------------------------------------------------
+% 从 .irc / .ird 文件恢复定点信道。
+%
+% .irc:
+%   每个 32-bit 字包含一组复数系数:
+%     [31:16] -> imag(int16)
+%     [15:0]  -> real(int16)
+%
+% .ird:
+%   每个 32-bit 字包含 delay 的“相邻 snapshot 增量”:
+%     BIT31   -> 增减方向
+%     BIT30:0 -> 幅值
+%
+% 恢复方式:
+%   - 第 1 个 snapshot 以前一帧 delay = 0 为基准
+%   - 后续 snapshot 通过逐帧累加 delta 恢复绝对 delay_clk
+%
+% 展开顺序必须与 ChannelFixedPointTools.m 写文件的顺序完全一致，
+% 否则会出现系数、tap、channel 对齐错误。
+% -------------------------------------------------------------------------
 T1_num = ceil(T_num / 4) * 4;
 Nchannel = IN_num * OUT_num;
 expectedWords = Nsamples * Nchannel * T1_num;
@@ -490,6 +544,24 @@ end
 end
 
 function y = simulateTimeVaryingFirDouble(inputs, H, samplesPerSnapshot)
+% simulateTimeVaryingFirDouble
+% -------------------------------------------------------------------------
+% 时变浮点 FIR / MIMO 参考实现。
+%
+% 这个函数的本质是“按输出时间索引 n”进行直接求和:
+%
+%   y_out(n, outIdx) =
+%       sum_{m=1..IN_num} sum_{t=1..T_num}
+%           x_in(n - delay(snap,t,ch), m) * h(snap,t,ch)
+%
+% 其中:
+%   - snap 由 n 所处的 snapshot 时间窗决定
+%   - 同一 snapshot 时间窗内，所有 tap 系数保持不变
+%   - 每个输出通道都要汇总来自所有输入通道的 FIR 结果
+%
+% 这里没有调用 MATLAB 的 conv()，是因为当前信道是“时变”的:
+% 不同时间窗对应不同的 snapshot 系数，因此更稳妥的方式是直接按时间索引求值。
+% -------------------------------------------------------------------------
 inputLen = size(inputs, 1);
 IN_num = size(inputs, 2);
 OUT_num = size(H.coeff, 3) / IN_num;
@@ -511,6 +583,8 @@ for n = 1:totalLen
             ch = (m - 1) * OUT_num + outIdx;
             acc = complex(0, 0);
             for t = 1:T_num
+                % delay 已经按当前阶段规则换算成样值移位。
+                % srcIdx 越界时，相当于 FIR 输入补零。
                 delay = double(H.delay_samples(snap, t, ch));
                 srcIdx = n - delay;
                 if srcIdx >= 1 && srcIdx <= inputLen
@@ -525,6 +599,28 @@ end
 end
 
 function accum = simulateTimeVaryingFirFixed(inputs, H, samplesPerSnapshot)
+% simulateTimeVaryingFirFixed
+% -------------------------------------------------------------------------
+% 时变定点 FIR / MIMO 参考实现。
+%
+% 设计目标:
+%   - 尽可能贴近 FPGA 的定点数据链路
+%   - 同时避免在 MATLAB 中过早截位
+%
+% 精度策略:
+%   1) 输入 IQ 为 int16
+%   2) 信道系数 real/imag 为 int16
+%   3) 单次乘法理论上是 16x16 -> 32 bit
+%   4) 但多个 tap 卷积、以及多输入通道求和后，累加精度可能超过 32 bit
+%   5) 因此这里统一使用 int64 做累加容器
+%
+% 复数乘法展开:
+%   (xr + j*xi) * (cr + j*ci)
+%     = (xr*cr - xi*ci) + j*(xr*ci + xi*cr)
+%
+% 返回值 accum 不是最终 16 bit 输出，而是“最终截位前”的全精度近似结果。
+% 后续动态 shift 搜索全部基于这个 accum 进行。
+% -------------------------------------------------------------------------
 inputLen = size(inputs, 1);
 IN_num = size(inputs, 2);
 OUT_num = H.OUT_num;
@@ -559,8 +655,8 @@ for n = 1:totalLen
                 cr = int64(H.qReal(snap, t, ch));
                 ci = int64(H.qImag(snap, t, ch));
 
-                % 复数乘法:
-                % (xr + j*xi) * (cr + j*ci)
+                % 复数乘法四项展开后再累加。
+                % 这里不做中途截位，避免把量化误差和位宽截断误差混在一起。
                 accR = accR + (xr * cr - xi * ci);
                 accI = accI + (xr * ci + xi * cr);
             end
@@ -574,6 +670,22 @@ accum = complex(accumReal, accumImag);
 end
 
 function [bestShift, bestInt16, bestMetric, bestInfo] = searchBestShift(accum, ref, metricMode, metricScale, shiftMin, shiftMax)
+% searchBestShift
+% -------------------------------------------------------------------------
+% 在给定 shift 搜索范围内寻找最佳右移位数。
+%
+% 搜索逻辑:
+%   1) 对每个候选 shift，把全精度 accum 右移 shift 位
+%   2) 截位并饱和到 int16
+%   3) 依据 metricScale 反标定到与参考输出一致的量纲
+%   4) 计算误差指标
+%   5) 以 MSE 最小为主判据；若并列，则优先 max_abs_error 更小；
+%      若仍并列，则选更小的 shift
+%
+% 这样做的好处是:
+%   - 把“乘加全精度”与“最终输出位宽约束”明确分离
+%   - 用户可以直观看到不同 shift 对误差和饱和的影响
+% -------------------------------------------------------------------------
 bestShift = shiftMin;
 bestInt16 = [];
 bestMetric = [];
@@ -611,6 +723,20 @@ tf = false;
 end
 
 function [outInt16, outMetric] = applyShiftToAccum(accum, shift, metricMode, metricScale)
+% applyShiftToAccum
+% -------------------------------------------------------------------------
+% 将全精度累加结果应用指定右移位数，并生成两份结果:
+%
+%   outInt16:
+%     真正的 16 bit 输出码流，适合导出到 .txt 或和 FPGA 原始输出比对
+%
+%   outMetric:
+%     为误差评估而反标定后的结果，量纲与 float reference 对齐
+%
+% 注意:
+%   右移发生在 int64 的全精度累加结果上，而不是在每个乘法或每个 tap 上。
+%   这正对应需求中的“最后一步再截位”。
+% -------------------------------------------------------------------------
 realShifted = saturateToInt16(bitshift(real(accum), -shift));
 imagShifted = saturateToInt16(bitshift(imag(accum), -shift));
 outInt16 = complex(realShifted, imagShifted);
@@ -618,10 +744,14 @@ gain = 2 ^ shift;
 
 switch metricMode
     case 'normalized'
+        % normalized:
+        %   反标定到接近浮点信号的归一化量纲，用于 sine / OFDM 误差比较。
         outMetric = complex( ...
             double(real(outInt16)) * gain / metricScale, ...
             double(imag(outInt16)) * gain / metricScale);
     case 'integer'
+        % integer:
+        %   保持原始整数码流比较口径，用于 debug 序列核对。
         outMetric = complex( ...
             double(real(outInt16)) * gain / metricScale, ...
             double(imag(outInt16)) * gain / metricScale);
