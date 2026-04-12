@@ -93,7 +93,7 @@ for tcIdx = 1:numel(testCases)
             % 步骤 5:
             % 对“一个信号 case + 一个信道组”执行完整验证。
             caseResult = runSingleCase(tc, chan, signalData.fs, opts);
-            results.cases{caseIdx, 1} = caseResult; %#ok<AGROW>
+            results.cases{caseIdx, 1} = caseResult; 
             printCaseSummary(caseResult);
             caseIdx = caseIdx + 1;
         catch ME
@@ -103,7 +103,7 @@ for tcIdx = 1:numel(testCases)
             errResult.channel_prefix = channelSets(chIdx).prefix;
             errResult.status = 'failed';
             errResult.error_message = ME.message;
-            results.cases{caseIdx, 1} = errResult; %#ok<AGROW>
+            results.cases{caseIdx, 1} = errResult; 
             caseIdx = caseIdx + 1;
         end
     end
@@ -266,13 +266,13 @@ function testCases = buildTestCases(signalData, includeDebug)
 % -------------------------------------------------------------------------
 testCasesCell = cell(0, 1);
 
-testCasesCell{end + 1, 1} = makeSignalCase( ... %#ok<AGROW>
+testCasesCell{end + 1, 1} = makeSignalCase( ... 
     'sine', ...
     signalData.float_cases.sine, ...
     signalData.fixed_cases.sine, ...
     'normalized');
 
-testCasesCell{end + 1, 1} = makeSignalCase( ... %#ok<AGROW>
+testCasesCell{end + 1, 1} = makeSignalCase( ... 
     'ofdm', ...
     signalData.float_cases.ofdm, ...
     signalData.fixed_cases.ofdm, ...
@@ -285,13 +285,13 @@ if includeDebug
     dbgImagRef = complex(double(real(signalData.fixed_cases.debug_imag)), ...
         double(imag(signalData.fixed_cases.debug_imag)));
 
-    testCasesCell{end + 1, 1} = makeSignalCase( ... %#ok<AGROW>
+    testCasesCell{end + 1, 1} = makeSignalCase( ... 
         'debug_real', ...
         dbgRealRef, ...
         signalData.fixed_cases.debug_real, ...
         'integer');
 
-    testCasesCell{end + 1, 1} = makeSignalCase( ... %#ok<AGROW>
+    testCasesCell{end + 1, 1} = makeSignalCase( ... 
         'debug_imag', ...
         dbgImagRef, ...
         signalData.fixed_cases.debug_imag, ...
@@ -960,18 +960,18 @@ base = sprintf('%s__%s', caseResult.signal_name, caseResult.channel_prefix);
 matPath = fullfile(outputDir, [base, '.mat']);
 reportPath = fullfile(outputDir, [base, '_report.txt']);
 
-float_out = caseResult.float_out; %#ok<NASGU>
-fixed_accum = caseResult.fixed_accum; %#ok<NASGU>
-fixed_out_int16 = caseResult.fixed_out_int16; %#ok<NASGU>
-fixed_out_metric = caseResult.fixed_out_metric; %#ok<NASGU>
-summary = rmfield(caseResult, {'float_out', 'fixed_accum', 'fixed_out_int16', 'fixed_out_metric'}); %#ok<NASGU>
+float_out = caseResult.float_out; 
+fixed_accum = caseResult.fixed_accum; 
+fixed_out_int16 = caseResult.fixed_out_int16; 
+fixed_out_metric = caseResult.fixed_out_metric; 
+summary = rmfield(caseResult, {'float_out', 'fixed_accum', 'fixed_out_int16', 'fixed_out_metric'}); 
 save(matPath, 'summary', 'float_out', 'fixed_accum', 'fixed_out_int16', 'fixed_out_metric', '-v7.3');
 
 fid = fopen(reportPath, 'w', 'n', 'UTF-8');
 if fid < 0
     error('无法写入报告文件: %s', reportPath);
 end
-cleanupObj = onCleanup(@() fclose(fid)); %#ok<NASGU>
+cleanupObj = onCleanup(@() fclose(fid)); 
 
 fprintf(fid, 'Signal name          : %s\n', caseResult.signal_name);
 fprintf(fid, 'Channel prefix       : %s\n', caseResult.channel_prefix);
@@ -1090,7 +1090,7 @@ fid = fopen(pathName, 'w', 'n', 'UTF-8');
 if fid < 0
     error('无法写入文件: %s', pathName);
 end
-cleanupObj = onCleanup(@() fclose(fid)); %#ok<NASGU>
+cleanupObj = onCleanup(@() fclose(fid)); 
 
 for k = 1:numel(iqData)
     iVal = typecast(int16(real(iqData(k))), 'uint16');
@@ -1109,7 +1109,7 @@ fid = fopen(pathName, 'w', 'n', 'UTF-8');
 if fid < 0
     error('无法写入文件: %s', pathName);
 end
-cleanupObj = onCleanup(@() fclose(fid)); %#ok<NASGU>
+cleanupObj = onCleanup(@() fclose(fid)); 
 
 for k = 1:numel(x)
     fprintf(fid, '%.12e %.12e\n', real(x(k)), imag(x(k)));
