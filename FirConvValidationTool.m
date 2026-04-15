@@ -24,6 +24,10 @@ function results = FirConvValidationTool(varargin)
 % -------------------------------------------------------------------------
 
 rootDir = fileparts(mfilename('fullpath'));
+
+% 步骤 1:
+% 解析用户传入的可选参数，得到输入目录、输出目录、
+% 是否包含 debug 序列、shift 搜索范围等运行配置。
 opts = parseInputs(rootDir, varargin{:});
 
 fprintf('==================================================\n');
@@ -42,12 +46,28 @@ end
 
 ensureDir(opts.output_dir);
 
+% 步骤 2:
+% 读取 signalGen\ 下的浮点 IQ 和定点 IQ 资源。
+% 这里会同时检查:
+%   - 浮点 .mat 是否存在
+%   - 定点 .txt 是否存在
+%   - 必需变量是否完整
 signalData = loadSignalResources(opts.signal_dir);
+
+% 步骤 3:
+% 扫描 channelGen\，自动发现所有合法信道组。
+% 每组信道至少需要:
+%   - 一个包含 H 的 .mat
+%   - 一个同前缀 .irc
+%   - 一个同前缀 .ird
 channelSets = discoverChannelSets(opts.channel_dir);
 if isempty(channelSets)
     error('在 %s 下没有找到可用的信道文件组。', opts.channel_dir);
 end
 
+% 步骤 4:
+% 根据是否启用 debug 序列，构建待验证的 IQ 测试集合。
+% 默认只验证 sine / ofdm。
 testCases = buildTestCases(signalData, opts.include_debug);
 
 results = struct();
@@ -70,8 +90,10 @@ for tcIdx = 1:numel(testCases)
             chan = channelSets(chIdx);
             fprintf('Channel set: %s\n', chan.prefix);
 
+            % 步骤 5:
+            % 对“一个信号 case + 一个信道组”执行完整验证。
             caseResult = runSingleCase(tc, chan, signalData.fs, opts);
-            results.cases{caseIdx, 1} = caseResult; %#ok<AGROW>
+            results.cases{caseIdx, 1} = caseResult; 
             printCaseSummary(caseResult);
             caseIdx = caseIdx + 1;
         catch ME
@@ -81,18 +103,38 @@ for tcIdx = 1:numel(testCases)
             errResult.channel_prefix = channelSets(chIdx).prefix;
             errResult.status = 'failed';
             errResult.error_message = ME.message;
-            results.cases{caseIdx, 1} = errResult; %#ok<AGROW>
+            results.cases{caseIdx, 1} = errResult; 
             caseIdx = caseIdx + 1;
         end
     end
 end
 
+% 步骤 6:
+% 将所有 case 的汇总结果保存到 MAT 文件，便于后处理和批量分析。
 summaryFile = fullfile(opts.output_dir, 'validation_summary.mat');
 save(summaryFile, 'results', '-v7.3');
 fprintf('\nSummary saved: %s\n', summaryFile);
 end
 
 function opts = parseInputs(rootDir, varargin)
+% parseInputs
+% -------------------------------------------------------------------------
+% 解析主函数的 Name-Value 输入参数。
+%
+% 输入:
+%   rootDir   - 当前工具所在目录
+%   varargin  - 用户传入的可选参数
+%
+% 输出:
+%   opts      - 统一后的配置结构体
+%
+% 当前支持的参数包括:
+%   signal_dir, channel_dir, output_dir
+%   include_debug
+%   manual_shift
+%   shift_min, shift_max
+%   wide_shift_min, wide_shift_max
+% -------------------------------------------------------------------------
 opts = struct();
 opts.signal_dir = fullfile(rootDir, 'signalGen');
 opts.channel_dir = fullfile(rootDir, 'channelGen');
@@ -141,6 +183,28 @@ end
 end
 
 function signalData = loadSignalResources(signalDir)
+% loadSignalResources
+% -------------------------------------------------------------------------
+% 读取 signalGen\ 下的所有 IQ 资源。
+%
+% 读取内容:
+%   1) 浮点 IQ:
+%        fpga_test_signals.mat 中的 fs / iq_sine_float / iq_ofdm_float
+%   2) 定点 IQ:
+%        sim_sine_iq.txt
+%        sim_ofdm_iq.txt
+%        sim_debug_real_iq.txt
+%        sim_debug_imag_iq.txt
+%
+% 输出:
+%   signalData.fs
+%   signalData.float_cases
+%   signalData.fixed_cases
+%
+% 说明:
+%   - 所有定点 IQ 都必须从 .txt 读取
+%   - 调试序列不从 .mat 读取
+% -------------------------------------------------------------------------
 matPath = fullfile(signalDir, 'fpga_test_signals.mat');
 if ~isfile(matPath)
     error('缺少浮点 IQ 文件: %s', matPath);
@@ -185,15 +249,30 @@ signalData.fixed_cases.debug_imag = readIqHexFile(fixedFiles.debug_imag);
 end
 
 function testCases = buildTestCases(signalData, includeDebug)
+% buildTestCases
+% -------------------------------------------------------------------------
+% 根据运行开关构建待验证的 IQ 信号集合。
+%
+% 默认包含:
+%   - sine
+%   - ofdm
+%
+% 可选附加:
+%   - debug_real
+%   - debug_imag
+%
+% 注意:
+%   debug 序列的“参考输入”也来自 .txt 解析结果，而不是 .mat。
+% -------------------------------------------------------------------------
 testCasesCell = cell(0, 1);
 
-testCasesCell{end + 1, 1} = makeSignalCase( ... %#ok<AGROW>
+testCasesCell{end + 1, 1} = makeSignalCase( ... 
     'sine', ...
     signalData.float_cases.sine, ...
     signalData.fixed_cases.sine, ...
     'normalized');
 
-testCasesCell{end + 1, 1} = makeSignalCase( ... %#ok<AGROW>
+testCasesCell{end + 1, 1} = makeSignalCase( ... 
     'ofdm', ...
     signalData.float_cases.ofdm, ...
     signalData.fixed_cases.ofdm, ...
@@ -206,13 +285,13 @@ if includeDebug
     dbgImagRef = complex(double(real(signalData.fixed_cases.debug_imag)), ...
         double(imag(signalData.fixed_cases.debug_imag)));
 
-    testCasesCell{end + 1, 1} = makeSignalCase( ... %#ok<AGROW>
+    testCasesCell{end + 1, 1} = makeSignalCase( ... 
         'debug_real', ...
         dbgRealRef, ...
         signalData.fixed_cases.debug_real, ...
         'integer');
 
-    testCasesCell{end + 1, 1} = makeSignalCase( ... %#ok<AGROW>
+    testCasesCell{end + 1, 1} = makeSignalCase( ... 
         'debug_imag', ...
         dbgImagRef, ...
         signalData.fixed_cases.debug_imag, ...
@@ -223,6 +302,16 @@ testCases = vertcat(testCasesCell{:});
 end
 
 function tc = makeSignalCase(name, floatInput, fixedInput, metricMode)
+% makeSignalCase
+% -------------------------------------------------------------------------
+% 将一个 IQ 信号样例封装成统一结构，供主流程逐项处理。
+%
+% 输入:
+%   name       - 用例名，例如 sine / ofdm / debug_real
+%   floatInput - 参考输入序列
+%   fixedInput - 定点输入序列
+%   metricMode - normalized 或 integer
+% -------------------------------------------------------------------------
 tc = struct();
 tc.name = name;
 tc.float_input = ensureColumnComplexDouble(floatInput);
@@ -231,6 +320,19 @@ tc.metric_mode = metricMode;
 end
 
 function channelSets = discoverChannelSets(channelDir)
+% discoverChannelSets
+% -------------------------------------------------------------------------
+% 扫描 channelGen\ 下所有可用信道组。
+%
+% 匹配规则:
+%   - 遍历所有 .mat
+%   - 仅保留包含变量 H 的文件
+%   - 将 *_fixedpoint.mat 归一化成信道前缀
+%   - 检查同前缀 .irc / .ird 是否存在
+%
+% 输出:
+%   channelSets(i) 为一组可直接用于仿真的信道描述结构
+% -------------------------------------------------------------------------
 matFiles = dir(fullfile(channelDir, '*.mat'));
 channelSetsCell = cell(0, 1);
 
@@ -292,6 +394,15 @@ end
 end
 
 function validateH(H, matPath)
+% validateH
+% -------------------------------------------------------------------------
+% 检查信道矩阵 H 是否满足当前工具的基本格式要求。
+%
+% 要求:
+%   - H 必须是数值数组
+%   - 维度只能是 2D 或 3D
+%   - 第二维必须是 3 的整数倍，对应 [delay, real, imag] 三元组
+% -------------------------------------------------------------------------
 if ~isnumeric(H)
     error('文件 %s 中的 H 不是数值数组。', matPath);
 end
@@ -304,6 +415,11 @@ end
 end
 
 function v = pickFieldScalar(s, names)
+% pickFieldScalar
+% -------------------------------------------------------------------------
+% 在结构体 s 中按候选字段名顺序读取一个数值标量。
+% 如果没有找到有效字段，则返回 NaN。
+% -------------------------------------------------------------------------
 v = NaN;
 for i = 1:numel(names)
     if isfield(s, names{i})
@@ -424,6 +540,11 @@ writeCaseOutputs(out, opts.output_dir);
 end
 
 function signalSources = buildSignalSources(tc, signalDir)
+% buildSignalSources
+% -------------------------------------------------------------------------
+% 根据当前测试信号名，构建其对应的输入文件路径记录。
+% 这些路径会被写入报告，方便用户追踪数据来源。
+% -------------------------------------------------------------------------
 signalSources = struct();
 switch tc.name
     case 'sine'
@@ -445,6 +566,18 @@ end
 end
 
 function packed = unpackFloatH(H)
+% unpackFloatH
+% -------------------------------------------------------------------------
+% 从浮点 H 中拆出:
+%   - delay_ns
+%   - real
+%   - imag
+%   - coeff = real + j*imag
+%   - delay_samples
+%
+% 当前阶段固定 clk = fs = 245.76e6，因此 delay_samples 直接由
+% delay_ns 乘以采样率换算得到。
+% -------------------------------------------------------------------------
 packed = struct();
 packed.delay_ns = extractTriplet(H, 1);
 packed.real = extractTriplet(H, 2);
@@ -536,6 +669,14 @@ packed.OUT_num = OUT_num;
 end
 
 function X = expandInputs(x, inNum)
+% expandInputs
+% -------------------------------------------------------------------------
+% 当信道要求 IN_num > 1 而输入只有一路时，按容错规则将同一路输入复制
+% 到多路输入端口上。
+%
+% 输出:
+%   X 的尺寸为 [Nsamples, inNum]
+% -------------------------------------------------------------------------
 x = x(:);
 X = zeros(numel(x), inNum, 'like', x);
 for k = 1:inNum
@@ -704,6 +845,15 @@ end
 end
 
 function tf = isBetterMetric(info, bestInfo, shift, bestShift)
+% isBetterMetric
+% -------------------------------------------------------------------------
+% 比较两个 shift 候选解的优劣。
+%
+% 优先级:
+%   1) MSE 更小
+%   2) 若 MSE 近似相同，则 max_abs_error 更小
+%   3) 若仍相同，则取更小的 shift
+% -------------------------------------------------------------------------
 tol = 1e-18;
 if info.mse < bestInfo.mse - tol
     tf = true;
@@ -761,6 +911,17 @@ end
 end
 
 function info = evaluateError(ref, test, metricMode)
+% evaluateError
+% -------------------------------------------------------------------------
+% 计算参考输出与测试输出之间的误差指标。
+%
+% 输出指标:
+%   - mse
+%   - max_abs_error
+%   - mean_abs_error
+%
+% 当前比较方式统一基于复数误差幅度 abs(ref - test)。
+% -------------------------------------------------------------------------
 ref = ref(:);
 test = test(:);
 if numel(ref) ~= numel(test)
@@ -781,22 +942,36 @@ info.mean_abs_error = mean(diffVal);
 end
 
 function writeCaseOutputs(caseResult, outputDir)
+% writeCaseOutputs
+% -------------------------------------------------------------------------
+% 为每个测试组合写出:
+%   1) MAT 结果文件
+%   2) 文本报告
+%   3) 定点输出 IQ 文本
+%   4) 浮点输出文本
+%   5) 浮点/定点输出频域图
+%
+% 频域图部分用于人工检查:
+%   - 主瓣位置是否一致
+%   - 带宽是否一致
+%   - 定点化后杂散与底噪是否明显恶化
+% -------------------------------------------------------------------------
 base = sprintf('%s__%s', caseResult.signal_name, caseResult.channel_prefix);
 matPath = fullfile(outputDir, [base, '.mat']);
 reportPath = fullfile(outputDir, [base, '_report.txt']);
 
-float_out = caseResult.float_out; %#ok<NASGU>
-fixed_accum = caseResult.fixed_accum; %#ok<NASGU>
-fixed_out_int16 = caseResult.fixed_out_int16; %#ok<NASGU>
-fixed_out_metric = caseResult.fixed_out_metric; %#ok<NASGU>
-summary = rmfield(caseResult, {'float_out', 'fixed_accum', 'fixed_out_int16', 'fixed_out_metric'}); %#ok<NASGU>
+float_out = caseResult.float_out; 
+fixed_accum = caseResult.fixed_accum; 
+fixed_out_int16 = caseResult.fixed_out_int16; 
+fixed_out_metric = caseResult.fixed_out_metric; 
+summary = rmfield(caseResult, {'float_out', 'fixed_accum', 'fixed_out_int16', 'fixed_out_metric'}); 
 save(matPath, 'summary', 'float_out', 'fixed_accum', 'fixed_out_int16', 'fixed_out_metric', '-v7.3');
 
 fid = fopen(reportPath, 'w', 'n', 'UTF-8');
 if fid < 0
     error('无法写入报告文件: %s', reportPath);
 end
-cleanupObj = onCleanup(@() fclose(fid)); %#ok<NASGU>
+cleanupObj = onCleanup(@() fclose(fid)); 
 
 fprintf(fid, 'Signal name          : %s\n', caseResult.signal_name);
 fprintf(fid, 'Channel prefix       : %s\n', caseResult.channel_prefix);
@@ -825,18 +1000,35 @@ fprintf(fid, 'Channel IRD          : %s\n', caseResult.channel_files.ird);
 for outIdx = 1:caseResult.OUT_num
     hexPath = fullfile(outputDir, sprintf('%s_fixed_out_ch%02d.txt', base, outIdx));
     floatTxtPath = fullfile(outputDir, sprintf('%s_float_out_ch%02d.txt', base, outIdx));
+    spectrumPath = fullfile(outputDir, sprintf('%s_spectrum_ch%02d.png', base, outIdx));
     writeIqHexFile(caseResult.fixed_out_int16(:, outIdx), hexPath);
     writeComplexText(caseResult.float_out(:, outIdx), floatTxtPath);
+    writeSpectrumFigure(caseResult, outIdx, outputDir, base);
+    fprintf(fid, 'Fixed OUT TXT ch%02d   : %s\n', outIdx, hexPath);
+    fprintf(fid, 'Float OUT TXT ch%02d   : %s\n', outIdx, floatTxtPath);
+    fprintf(fid, 'Spectrum PNG ch%02d    : %s\n', outIdx, spectrumPath);
 end
 end
 
 function printCaseSummary(caseResult)
+% printCaseSummary
+% -------------------------------------------------------------------------
+% 在命令行中打印单个 case 的关键摘要，便于批量运行时快速浏览。
+% -------------------------------------------------------------------------
 fprintf('  shift=%d, wideSuggest=%d, mse=%.6e, meanAbs=%.6e, maxAbs=%.6e\n', ...
     caseResult.best_shift, caseResult.wide_shift_suggestion, ...
     caseResult.mse, caseResult.mean_abs_error, caseResult.max_abs_error);
 end
 
 function x = ensureColumnComplexDouble(x)
+% ensureColumnComplexDouble
+% -------------------------------------------------------------------------
+% 将输入统一转换为“列向量 complex double”。
+%
+% 作用:
+%   - 保证后续卷积实现不需要处理行向量/列向量差异
+%   - 保证浮点链路输入类型统一
+% -------------------------------------------------------------------------
 x = x(:);
 if ~isa(x, 'double')
     x = double(x);
@@ -848,6 +1040,14 @@ x = complex(x, zeros(size(x)));
 end
 
 function data = readIqHexFile(pathName)
+% readIqHexFile
+% -------------------------------------------------------------------------
+% 读取 IQ 十六进制文本文件，并恢复为 complex(int16) 列向量。
+%
+% 每个 32-bit 字的格式为:
+%   [31:16] -> Q / imag
+%   [15:0]  -> I / real
+% -------------------------------------------------------------------------
 words = readPackedHexWords(pathName);
 re = zeros(numel(words), 1, 'int16');
 im = zeros(numel(words), 1, 'int16');
@@ -859,6 +1059,14 @@ data = complex(re, im);
 end
 
 function words = readPackedHexWords(pathName)
+% readPackedHexWords
+% -------------------------------------------------------------------------
+% 从文本中提取所有 32-bit 十六进制字。
+%
+% 处理方式:
+%   - 去掉所有空白字符
+%   - 每 8 个十六进制字符解析为一个 uint32
+% -------------------------------------------------------------------------
 txt = fileread(pathName);
 txt = regexprep(txt, '\s+', '');
 if mod(numel(txt), 8) ~= 0
@@ -873,11 +1081,16 @@ end
 end
 
 function writeIqHexFile(iqData, pathName)
+% writeIqHexFile
+% -------------------------------------------------------------------------
+% 将 complex(int16) 输出序列写回 IQ 十六进制文本格式。
+% 输出格式与 signalGen\ 中的输入 IQ 文本保持一致。
+% -------------------------------------------------------------------------
 fid = fopen(pathName, 'w', 'n', 'UTF-8');
 if fid < 0
     error('无法写入文件: %s', pathName);
 end
-cleanupObj = onCleanup(@() fclose(fid)); %#ok<NASGU>
+cleanupObj = onCleanup(@() fclose(fid)); 
 
 for k = 1:numel(iqData)
     iVal = typecast(int16(real(iqData(k))), 'uint16');
@@ -887,11 +1100,16 @@ end
 end
 
 function writeComplexText(x, pathName)
+% writeComplexText
+% -------------------------------------------------------------------------
+% 将复数序列以“实部 虚部”两列文本的方式写到文件，便于人工查看
+% 或其他脚本工具读取。
+% -------------------------------------------------------------------------
 fid = fopen(pathName, 'w', 'n', 'UTF-8');
 if fid < 0
     error('无法写入文件: %s', pathName);
 end
-cleanupObj = onCleanup(@() fclose(fid)); %#ok<NASGU>
+cleanupObj = onCleanup(@() fclose(fid)); 
 
 for k = 1:numel(x)
     fprintf(fid, '%.12e %.12e\n', real(x(k)), imag(x(k)));
@@ -899,11 +1117,97 @@ end
 end
 
 function y = saturateToInt16(x)
+% saturateToInt16
+% -------------------------------------------------------------------------
+% 对整数数组执行 int16 饱和裁剪。
+%
+% 作用:
+%   在最终输出阶段模拟 FPGA 输出位宽限制，超出 [-32768, 32767]
+%   的值直接钳位。
+% -------------------------------------------------------------------------
 x = min(max(x, int64(-32768)), int64(32767));
 y = int16(x);
 end
 
+function writeSpectrumFigure(caseResult, outIdx, outputDir, base)
+% writeSpectrumFigure
+% -------------------------------------------------------------------------
+% 分别绘制定点输出和浮点输出的频域图。
+%
+% 图中采用上下两个子图:
+%   - 上图: float output spectrum
+%   - 下图: fixed output spectrum
+%
+% 这里使用最基础的 FFT 计算归一化频谱，避免引入额外工具箱依赖。
+% 对于定点输出:
+%   - 使用 fixed_out_metric 作为频域绘图输入
+%   - 这样量纲与当前误差分析口径保持一致
+% -------------------------------------------------------------------------
+floatSig = caseResult.float_out(:, outIdx);
+fixedSig = caseResult.fixed_out_metric(:, outIdx);
+
+[freqFloatMHz, specFloatDb] = computeSpectrumDb(floatSig, caseResult.fs_hz);
+[freqFixedMHz, specFixedDb] = computeSpectrumDb(fixedSig, caseResult.fs_hz);
+
+fig = figure('Visible', 'off', 'Color', 'w', 'Position', [100, 100, 1000, 700]);
+
+subplot(2, 1, 1);
+plot(freqFloatMHz, specFloatDb, 'b', 'LineWidth', 1.1);
+grid on;
+xlabel('Frequency (MHz)');
+ylabel('Norm PSD (dB)');
+title(sprintf('Float Output Spectrum: %s / ch%02d', strrep(base, '_', '\_'), outIdx));
+
+subplot(2, 1, 2);
+plot(freqFixedMHz, specFixedDb, 'r', 'LineWidth', 1.1);
+grid on;
+xlabel('Frequency (MHz)');
+ylabel('Norm PSD (dB)');
+title(sprintf('Fixed Output Spectrum: %s / ch%02d', strrep(base, '_', '\_'), outIdx));
+
+pngPath = fullfile(outputDir, sprintf('%s_spectrum_ch%02d.png', base, outIdx));
+saveas(fig, pngPath);
+close(fig);
+end
+
+function [freqMHz, specDb] = computeSpectrumDb(x, fs)
+% computeSpectrumDb
+% -------------------------------------------------------------------------
+% 计算一个复数输出序列的归一化频谱。
+%
+% 实现说明:
+%   1) 取前 N 个样点做 FFT，N 取不超过 65536 的 2 次幂
+%   2) 频谱做 fftshift，得到 [-fs/2, fs/2) 频轴
+%   3) 功率归一化到最大值 0 dB，便于比较浮点与定点结果
+% -------------------------------------------------------------------------
+x = x(:);
+n = min(numel(x), 65536);
+nfft = 2 ^ nextpow2(max(n, 1));
+x = x(1:n);
+if numel(x) < nfft
+    x = [x; zeros(nfft - numel(x), 1)];
+end
+
+X = fftshift(fft(x, nfft));
+powerVal = abs(X) .^ 2;
+powerVal = powerVal / max(max(powerVal), eps);
+specDb = 10 * log10(max(powerVal, 1e-12));
+freqAxis = ((-nfft/2):(nfft/2 - 1)).' / nfft * fs;
+freqMHz = freqAxis / 1e6;
+end
+
 function scale = estimateCoeffScale(floatH, fixedH)
+% estimateCoeffScale
+% -------------------------------------------------------------------------
+% 估计浮点系数与定点系数之间的量化缩放因子。
+%
+% 背景:
+%   当前信道定点化并不是简单的 Q15，而是按一组单独的 scale 量化。
+%   为了把定点链路结果正确反标定到浮点量纲，需要估计这个 scale。
+%
+% 方法:
+%   对非零浮点系数做最小二乘意义下的比例拟合。
+% -------------------------------------------------------------------------
 floatVals = [real(floatH.coeff(:)); imag(floatH.coeff(:))];
 fixedVals = [double(fixedH.qReal(:)); double(fixedH.qImag(:))];
 mask = abs(floatVals) > 1e-12;
@@ -924,6 +1228,18 @@ end
 end
 
 function X = extractTriplet(H, pos)
+% extractTriplet
+% -------------------------------------------------------------------------
+% 从 H 的 [delay, real, imag] 三元组布局中提取指定分量。
+%
+% pos:
+%   1 -> delay
+%   2 -> real
+%   3 -> imag
+%
+% 输出统一为 3D 形式:
+%   [Nsamples, T_num, Nchannel]
+% -------------------------------------------------------------------------
 if ismatrix(H)
     X = zeros(size(H, 1), size(H, 2) / 3, 1);
     X(:, :, 1) = H(:, pos:3:end);
@@ -936,6 +1252,11 @@ end
 end
 
 function n = size3(x)
+% size3
+% -------------------------------------------------------------------------
+% 安全获取数组第三维大小。
+% 对 2D 数组返回 1。
+% -------------------------------------------------------------------------
 if ndims(x) < 3
     n = 1;
 else
@@ -944,6 +1265,10 @@ end
 end
 
 function ensureDir(pathName)
+% ensureDir
+% -------------------------------------------------------------------------
+% 若目录不存在则创建。
+% -------------------------------------------------------------------------
 if ~isfolder(pathName)
     mkdir(pathName);
 end

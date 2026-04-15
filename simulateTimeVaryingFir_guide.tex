@@ -1,0 +1,429 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\geometry{margin=1in}
+
+\title{simulateTimeVaryingFirDouble 与 simulateTimeVaryingFirFixed 说明文档}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{文档目的}
+
+本文档用于详细说明 \texttt{FirConvValidationTool.m} 中以下两个函数的实现思路与处理流程：
+
+\begin{itemize}
+\item \texttt{simulateTimeVaryingFirDouble}
+\item \texttt{simulateTimeVaryingFirFixed}
+\end{itemize}
+
+这两个函数分别对应：
+
+\begin{itemize}
+\item 浮点参考链路的时变 FIR / MIMO 卷积
+\item 定点链路的时变 FIR / MIMO 卷积
+\end{itemize}
+
+两者共享同一个总体目标：在给定输入 IQ 数据与时变信道系数的情况下，按时间顺序计算每个输出通道的复数卷积结果。
+
+\section{问题背景}
+
+\subsection{为什么不是普通的固定系数 FIR}
+
+普通 FIR 可以写成固定系数卷积：
+
+\begin{equation}
+y[n] = \sum_{k=0}^{K-1} h[k]\,x[n-k]
+\end{equation}
+
+其中系数 $h[k]$ 在整个计算过程中不变化。
+
+但本项目中的信道是\textbf{时变}的。信道矩阵 $H$ 由多个 CIR snapshot 组成，每个 snapshot 都包含一组 tap：
+
+\begin{equation}
+H(s, t, ch)
+\end{equation}
+
+其中：
+
+\begin{itemize}
+\item $s$ 表示 snapshot 索引
+\item $t$ 表示 tap 索引
+\item $ch$ 表示输入输出通道组合后的信道索引
+\end{itemize}
+
+因此这里不能简单地把整个问题看成一次固定系数卷积，而必须在输出时间轴上逐点判断当前属于哪个 snapshot，然后使用该 snapshot 对应的 tap 系数和 delay。
+
+\subsection{MIMO 结构}
+
+若输入通道数为 $IN\_num$，输出通道数为 $OUT\_num$，则一共有
+
+\begin{equation}
+IN\_num \times OUT\_num
+\end{equation}
+
+个子信道 FIR 单元。
+
+项目中采用的通道索引映射关系为：
+
+\begin{equation}
+ch = (m - 1)\cdot OUT\_num + n
+\end{equation}
+
+其中：
+
+\begin{itemize}
+\item $m$ 是输入通道编号
+\item $n$ 是输出通道编号
+\end{itemize}
+
+对每个输出通道，需要将所有输入通道对应的 FIR 输出结果求和。
+
+\section{统一数学模型}
+
+\subsection{时变复数 FIR 的输出公式}
+
+设：
+
+\begin{itemize}
+\item $x_m[n]$ 为第 $m$ 路输入 IQ
+\item $y_n[n]$ 为第 $n$ 路输出 IQ
+\item $h_{m,n}^{(s)}[t]$ 为 snapshot $s$ 时，第 $(m,n)$ 个子信道第 $t$ 个 tap 的复数系数
+\item $d_{m,n}^{(s)}[t]$ 为对应的 delay
+\end{itemize}
+
+则输出可写为：
+
+\begin{equation}
+y_n[k]
+=
+\sum_{m=1}^{IN\_num}
+\sum_{t=1}^{T\_num}
+h_{m,n}^{(s(k))}[t]\,
+x_m\!\left[k - d_{m,n}^{(s(k))}[t]\right]
+\end{equation}
+
+其中：
+
+\begin{equation}
+s(k) = \min\left(\left\lfloor \frac{k-1}{N_{\text{snap}}} \right\rfloor + 1,\; N_{\text{samples}}\right)
+\end{equation}
+
+$N_{\text{snap}}$ 表示每个 snapshot 对应的采样点数：
+
+\begin{equation}
+N_{\text{snap}} = \mathrm{round}\!\left(\frac{f_s}{CIR\_update\_rate}\right)
+\end{equation}
+
+这正是代码中 \texttt{samplesPerSnapshot} 的来源。
+
+\section{simulateTimeVaryingFirDouble 说明}
+
+\subsection{作用}
+
+\texttt{simulateTimeVaryingFirDouble} 用于生成\textbf{浮点参考输出}。
+
+它的核心思想是：
+
+\begin{itemize}
+\item 输入 IQ 使用 \texttt{double complex}
+\item 信道系数也使用浮点复数
+\item delay 已按当前阶段规则换算成样值移位
+\item 不考虑中途量化误差
+\end{itemize}
+
+因此它代表的是理想参考链路。
+
+\subsection{输入含义}
+
+函数输入：
+
+\begin{itemize}
+\item \texttt{inputs}：尺寸为 $[N, IN\_num]$ 的复数输入矩阵
+\item \texttt{H.coeff}：尺寸为 $[N_{snap}, T\_num, IN\_num\cdot OUT\_num]$ 的复数系数
+\item \texttt{H.delay\_samples}：与系数同维度的样值延迟
+\item \texttt{samplesPerSnapshot}：每个 snapshot 持续的采样点数
+\end{itemize}
+
+\subsection{流程拆解}
+
+\subsubsection{步骤 1：确定输出长度}
+
+输出长度设置为：
+
+\begin{equation}
+N_{\text{out}} = N_{\text{in}} + d_{\max}
+\end{equation}
+
+其中 $d_{\max}$ 是所有 tap 中最大的 delay。
+
+这样做的原因是：信号经过延迟后，尾部会比输入更长，因此需要预留额外长度容纳最后一段能量。
+
+\subsubsection{步骤 2：按输出时间索引逐点计算}
+
+代码主循环的外层变量是输出样点索引 $n$：
+
+\begin{equation}
+n = 1,2,\dots,N_{\text{out}}
+\end{equation}
+
+对每个 $n$：
+
+\begin{enumerate}
+\item 先判断当前属于哪个 snapshot
+\item 再对所有输入通道和输出通道组合进行求和
+\item 再对该子信道下所有 tap 求和
+\end{enumerate}
+
+\subsubsection{步骤 3：根据 snapshot 选择系数}
+
+在输出样点 $n$ 上，snapshot 通过下面的规则确定：
+
+\begin{equation}
+s = \min\left(\left\lfloor \frac{n-1}{samplesPerSnapshot}\right\rfloor + 1,\; N_{snap}\right)
+\end{equation}
+
+这对应“零阶保持”逻辑：在一个 snapshot 时间窗内，系数保持不变。
+
+\subsubsection{步骤 4：按 delay 对输入取样}
+
+对某个 tap，如果当前 snapshot 下的 delay 为 $d$，则输入索引为：
+
+\begin{equation}
+srcIdx = n - d
+\end{equation}
+
+若 $srcIdx$ 越界，则该 tap 在此时刻贡献为 0，这等价于 FIR 的零填充边界处理。
+
+\subsubsection{步骤 5：复数乘法并累加}
+
+若输入样点为 $x$，系数为 $h$，则贡献为：
+
+\begin{equation}
+\Delta y = x \cdot h
+\end{equation}
+
+所有 tap 的贡献先在单个子信道内求和，再跨输入通道求和，最终得到每个输出通道的输出。
+
+\subsection{为什么采用“按时间点直接求和”}
+
+虽然文档中提到可使用 MATLAB 自带卷积函数，但在当前实现中采用了更直接的按时间索引求和方式。原因是：
+
+\begin{itemize}
+\item 当前信道是时变的，不是固定系数
+\item 每个 snapshot 的 delay 和系数都可能变化
+\item 直接按时间索引求值更容易保证逻辑正确
+\item 更接近 FPGA 真实按时钟推进的思维方式
+\end{itemize}
+
+\section{simulateTimeVaryingFirFixed 说明}
+
+\subsection{作用}
+
+\texttt{simulateTimeVaryingFirFixed} 用于生成\textbf{定点链路下的高精度累加结果}。
+
+注意，这个函数的输出并不是最终 16 bit IQ，而是：
+
+\begin{itemize}
+\item 已经完成所有 tap 卷积和多输入通道求和
+\item 但还没有执行最终动态截位
+\item 保持在较高整数精度下的中间结果
+\end{itemize}
+
+这个中间结果随后会交给 shift 搜索模块处理。
+
+\subsection{输入含义}
+
+函数输入：
+
+\begin{itemize}
+\item \texttt{inputs}：由 \texttt{.txt} 解析得到的复数 \texttt{int16} 输入
+\item \texttt{H.qReal}, \texttt{H.qImag}：由 \texttt{.irc} 恢复出的系数实部/虚部
+\item \texttt{H.delay\_clks}：由 \texttt{.ird} 恢复出的 delay 时钟计数
+\item \texttt{samplesPerSnapshot}：每个 snapshot 对应的样点数
+\end{itemize}
+
+\subsection{为什么不能只保留 32 bit}
+
+项目需求中提到：
+
+\begin{quote}
+定点乘法与加法全程保持 32 bit 全精度
+\end{quote}
+
+严格来说，这句话只对\textbf{单次乘法}成立。
+
+若输入和系数都是 16 bit，则单次乘法量级约为：
+
+\begin{equation}
+16 \text{ bit} \times 16 \text{ bit} \Rightarrow 32 \text{ bit}
+\end{equation}
+
+但卷积中会有两类额外增长：
+
+\begin{enumerate}
+\item 同一个子信道中多个 tap 的累加
+\item 同一个输出通道中多个输入通道结果的累加
+\end{enumerate}
+
+例如若有 $T\_num$ 个 tap，则仅 tap 求和就可能增加大约
+
+\begin{equation}
+\lceil \log_2(T\_num) \rceil
+\end{equation}
+
+位的动态范围。
+
+若再叠加 $IN\_num$ 路输入通道求和，还会进一步增长。
+
+因此代码里统一采用 \texttt{int64} 作为累加容器，这样可以避免在中途发生额外截断。
+
+\subsection{复数乘法展开}
+
+若输入 IQ 为
+
+\begin{equation}
+x = x_r + jx_i
+\end{equation}
+
+系数为
+
+\begin{equation}
+h = c_r + jc_i
+\end{equation}
+
+则两者乘积为：
+
+\begin{equation}
+xh = (x_r c_r - x_i c_i) + j(x_r c_i + x_i c_r)
+\end{equation}
+
+代码中正是按这个公式分别累加实部和虚部：
+
+\begin{align}
+accR &\leftarrow accR + (x_r c_r - x_i c_i) \\
+accI &\leftarrow accI + (x_r c_i + x_i c_r)
+\end{align}
+
+\subsection{流程拆解}
+
+\subsubsection{步骤 1：与浮点链路保持同样的时间推进}
+
+外层仍按输出样点索引 $n$ 推进，并根据 $n$ 计算当前 snapshot。
+
+这保证定点链路和浮点链路在时间轴上严格对齐。
+
+\subsubsection{步骤 2：按 delay\_clk 取输入样点}
+
+当前阶段由于 $clk = f_s$，所以：
+
+\begin{equation}
+delay\_clk = delay\_samples
+\end{equation}
+
+因此定点链路中可直接用 \texttt{delay\_clks} 作为样值移位。
+
+\subsubsection{步骤 3：单 tap 乘法}
+
+对每个 tap：
+
+\begin{itemize}
+\item 读取输入 I/Q 的 \texttt{int16}
+\item 读取系数实部/虚部的 \texttt{int16}
+\item 用 \texttt{int64} 执行复数乘法展开
+\end{itemize}
+
+\subsubsection{步骤 4：tap 内累加}
+
+在同一个子信道内，对所有 tap 的乘法结果累加，得到该子信道在当前输出时刻的贡献。
+
+\subsubsection{步骤 5：跨输入通道累加}
+
+对同一个输出通道，将所有输入通道对应子信道的结果再求和。
+
+最终得到：
+
+\begin{itemize}
+\item \texttt{accumReal(n, outIdx)}
+\item \texttt{accumImag(n, outIdx)}
+\end{itemize}
+
+\subsection{函数输出的物理意义}
+
+\texttt{simulateTimeVaryingFirFixed} 的输出可以理解为：
+
+\begin{quote}
+如果 FPGA 在最终输出位宽限制之前，先把所有乘法和加法都保存在一个足够宽的寄存器中，那么这个寄存器里应该接近什么数值。
+\end{quote}
+
+所以它是动态截位模块的输入，而不是最终可直接和 FPGA 16 bit 输出逐样比较的值。
+
+\section{两者之间的关系}
+
+\subsection{一个是参考，一个是待量化结果}
+
+\texttt{simulateTimeVaryingFirDouble} 给出的是浮点参考结果：
+
+\begin{equation}
+y_{\text{float}}[n]
+\end{equation}
+
+\texttt{simulateTimeVaryingFirFixed} 给出的是高精度定点累加结果：
+
+\begin{equation}
+y_{\text{acc}}[n]
+\end{equation}
+
+然后动态 shift 搜索模块会对 $y_{\text{acc}}[n]$ 施加右移、饱和和反标定，得到用于误差比较的结果：
+
+\begin{equation}
+y_{\text{fixed}}^{(N)}[n]
+\end{equation}
+
+其中 $N$ 为候选 shift。
+
+\subsection{最终目标}
+
+目标不是让高精度累加值直接接近浮点值，而是要找一个合适的 shift，使得最终 16 bit 输出在误差意义下最接近浮点参考：
+
+\begin{equation}
+N^\star = \arg\min_N \; \mathrm{MSE}\left(y_{\text{float}}, y_{\text{fixed}}^{(N)}\right)
+\end{equation}
+
+\section{更直观的理解方式}
+
+\subsection{浮点函数像什么}
+
+可以把 \texttt{simulateTimeVaryingFirDouble} 理解成：
+
+\begin{quote}
+拿一套理想精度的计算器，完全不考虑位宽限制，去计算时变信道卷积的正确答案。
+\end{quote}
+
+\subsection{定点函数像什么}
+
+可以把 \texttt{simulateTimeVaryingFirFixed} 理解成：
+
+\begin{quote}
+按 FPGA 的输入格式和系数量化格式做乘加，但先别急着截成 16 bit，而是把所有结果临时记在一个更宽的寄存器里，最后再统一考虑怎么截位最合理。
+\end{quote}
+
+\section{结论}
+
+这两个函数分工明确：
+
+\begin{itemize}
+\item \texttt{simulateTimeVaryingFirDouble} 负责给出理想参考输出
+\item \texttt{simulateTimeVaryingFirFixed} 负责给出定点链路下、截位前的高精度结果
+\end{itemize}
+
+后续的动态 shift 搜索、误差分析、频域比较，都是建立在这两个函数输出的基础上进行的。
+
+因此，这两个函数可以视为整个验证工具最核心的“参考链路”和“定点链路”计算内核。
+
+\end{document}
